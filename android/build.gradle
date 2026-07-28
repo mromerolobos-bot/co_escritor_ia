@@ -26,6 +26,17 @@ subprojects {
     project.evaluationDependsOn(':app')
 }
 
+// Inyección automática de compileSdkVersion 36 y AndroidX para subproyectos de plugins (speech_to_text, flutter_tts, etc.)
+subprojects {
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                compileSdkVersion 36
+            }
+        }
+    }
+}
+
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }
