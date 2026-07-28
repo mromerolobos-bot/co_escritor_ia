@@ -1,3 +1,4 @@
+Groovy
 buildscript {
     ext.kotlin_version = '1.9.0'
     repositories {
@@ -22,11 +23,8 @@ rootProject.buildDir = '../build'
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
 }
-subprojects {
-    project.evaluationDependsOn(':app')
-}
 
-// Inyección automática de compileSdkVersion 36 y AndroidX para subproyectos de plugins (speech_to_text, flutter_tts, etc.)
+// ARREGLO: La inyección de versión debe ir ANTES de empezar a evaluar el proyecto
 subprojects {
     afterEvaluate { project ->
         if (project.hasProperty('android')) {
@@ -35,6 +33,10 @@ subprojects {
             }
         }
     }
+}
+
+subprojects {
+    project.evaluationDependsOn(':app')
 }
 
 tasks.register("clean", Delete) {
