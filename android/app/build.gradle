@@ -1,8 +1,13 @@
 plugins {
     id "com.android.application"
     id "kotlin-android"
-    id "dev.flutter.flutter-gradle-plugin"
 }
+
+flutter {
+    source '../..'
+}
+
+apply plugin: "dev.flutter.flutter-gradle-plugin"
 
 def localProperties = new Properties()
 def localPropertiesFile = rootProject.file('local.properties')
@@ -54,6 +59,3 @@ android {
     }
 }
 
-flutter {
-    source '../..'
-}
