@@ -16,6 +16,13 @@ allprojects {
         google()
         mavenCentral()
     }
+    ext {
+        flutter = [
+            compileSdkVersion: 36,
+            minSdkVersion: 21,
+            targetSdkVersion: 36
+        ]
+    }
 }
 
 rootProject.buildDir = '../build'
