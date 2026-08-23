@@ -114,36 +114,81 @@ def log_message(msg: str, level: str = "INFO"):
         pass
 
 
+import tempfile
+
+GLOBAL_LOCK_FILE = os.path.join(tempfile.gettempdir(), "antigravity_inverse_bridge_global.lock")
+_MUTEX_HANDLE = None
+
+
 def acquire_lock() -> bool:
-    """Garantiza la ejecución de una única instancia del daemon."""
+    """Garantiza la ejecución de una única instancia del daemon a nivel de sistema operativo."""
+    global _MUTEX_HANDLE
+    
+    # 1. En Windows, usar Named Mutex a nivel de sesión
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            mutex_name = "Local\\AntigravityInverseBridge_SingleInstance_Mutex"
+            
+            # CreateMutexW(lpMutexAttributes, bInitialOwner, lpName)
+            kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            
+            handle = kernel32.CreateMutexW(None, True, mutex_name)
+            last_err = kernel32.GetLastError()
+            ERROR_ALREADY_EXISTS = 183
+
+            if last_err == ERROR_ALREADY_EXISTS or not handle:
+                log_message("Ya existe otra instancia activa de Inverse Bridge Daemon (Named Mutex bloqueado).", "WARNING")
+                return False
+
+            _MUTEX_HANDLE = handle
+        except Exception as e:
+            log_message(f"Advertencia creando Named Mutex: {e}", "WARNING")
+
+    # 2. File Lock global en TEMP
     try:
-        if os.path.exists(LOCK_FILE):
+        if os.path.exists(GLOBAL_LOCK_FILE):
             try:
-                with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                    pid = int(f.read().strip())
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                SYNCHRONIZE = 0x00100000
-                process = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-                if process:
-                    kernel32.CloseHandle(process)
-                    log_message(f"Daemon ya está ejecutándose en PID {pid}.", "WARNING")
-                    return False
+                with open(GLOBAL_LOCK_FILE, "r", encoding="utf-8") as f:
+                    old_pid = int(f.read().strip())
+                if sys.platform == "win32":
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    SYNCHRONIZE = 0x00100000
+                    process = kernel32.OpenProcess(SYNCHRONIZE, False, old_pid)
+                    if process:
+                        kernel32.CloseHandle(process)
+                        log_message(f"Daemon ya está ejecutándose en PID global {old_pid}.", "WARNING")
+                        return False
             except Exception:
                 pass
-        with open(LOCK_FILE, "w", encoding="utf-8") as f:
+
+        with open(GLOBAL_LOCK_FILE, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
         return True
     except Exception as e:
-        log_message(f"Error al adquirir lock file: {e}", "ERROR")
+        log_message(f"Error al adquirir lock global: {e}", "ERROR")
         return False
 
 
 def release_lock():
-    """Libera el lock file al terminar."""
+    """Libera el Named Mutex y el lock file global."""
+    global _MUTEX_HANDLE
+    if _MUTEX_HANDLE and sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(_MUTEX_HANDLE)
+            _MUTEX_HANDLE = None
+        except Exception:
+            pass
+
     try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+        if os.path.exists(GLOBAL_LOCK_FILE):
+            os.remove(GLOBAL_LOCK_FILE)
     except Exception:
         pass
 
@@ -757,10 +802,8 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                 "stdout": redact_secrets(stdout),
                 "stderr": redact_secrets(stderr)
             })
-            if exit_code != 0:
-                all_ok = False
-                if err:
-                    errors.append(err)
+            if err:
+                errors.append(err)
 
         for raw_path in file_list:
             full_path = raw_path if os.path.isabs(raw_path) else os.path.abspath(os.path.join(exec_cwd, raw_path))
@@ -776,9 +819,8 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                     })
                 except Exception as e:
                     errors.append(f"Error al leer {full_path}: {e}")
-                    all_ok = False
 
-        status = "DONE" if all_ok and not errors else "FAILED"
+        status = "DONE" if not errors else "FAILED"
         summary = f"Inspección READ_ONLY completada para target='{target or exec_cwd}'."
 
     # 5. Modo IMPLEMENT_AND_TEST (Bootstrap/Setup)
