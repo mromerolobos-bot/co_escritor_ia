@@ -20,7 +20,11 @@ Covers all PR review requirements, security controls, and MODE: AGENT_PROMPT:
 16. AGENT_PROMPT mode with mock backend (DONE + agent_response)
 17. AGENT_PROMPT mode with empty prompt (FAILED)
 18. AGENT_PROMPT secret redaction in response
-19. Full End-to-End Pipeline simulation
+19. AGENT_PROMPT max_prompt_chars limit enforcement
+20. AGENT_PROMPT max_response_chars limit enforcement
+21. AGENT_PROMPT unknown backend type rejection
+22. AGENT_PROMPT timeout handling
+23. Full End-to-End Pipeline simulation
 """
 
 import os
@@ -365,7 +369,62 @@ COMMANDS:
         self.assertNotIn("ghp_123456789012345678901234567890ABCDEF", report)
         self.assertIn("[REDACTED]", report)
 
-    # 19. Full End-to-End Pipeline simulation
+    # 19. AGENT_PROMPT max_prompt_chars limit test
+    def test_agent_prompt_max_prompt_limit(self):
+        backend_cfg = {
+            "enabled": True,
+            "type": "mock",
+            "timeout_seconds": 60,
+            "max_prompt_chars": 20,
+            "max_response_chars": 1000
+        }
+        long_prompt = "A" * 100
+        status, resp, err = run_agent_prompt(long_prompt, backend_cfg)
+        self.assertEqual(status, "DONE")
+        self.assertIn("20 chars", resp)
+
+    # 20. AGENT_PROMPT max_response_chars limit test
+    def test_agent_prompt_max_response_limit(self):
+        backend_cfg = {
+            "enabled": True,
+            "type": "mock",
+            "mock_response": "This is a natural text response from the agent model. " * 20,
+            "timeout_seconds": 60,
+            "max_prompt_chars": 1000,
+            "max_response_chars": 50
+        }
+        status, resp, err = run_agent_prompt("Hello", backend_cfg)
+        self.assertEqual(status, "DONE")
+        self.assertEqual(len(resp), 50)
+
+    # 21. AGENT_PROMPT unknown backend type rejection
+    def test_agent_prompt_unknown_backend(self):
+        backend_cfg = {
+            "enabled": True,
+            "type": "unsupported_futuristic_engine",
+            "timeout_seconds": 60,
+            "max_prompt_chars": 1000,
+            "max_response_chars": 1000
+        }
+        status, resp, err = run_agent_prompt("Hello", backend_cfg)
+        self.assertEqual(status, "BLOCKED")
+        self.assertIn("no soportado", err)
+
+    # 22. AGENT_PROMPT timeout handling
+    def test_agent_prompt_timeout_handling(self):
+        backend_cfg = {
+            "enabled": True,
+            "type": "mock",
+            "simulate_timeout": True,
+            "timeout_seconds": 5,
+            "max_prompt_chars": 1000,
+            "max_response_chars": 1000
+        }
+        status, resp, err = run_agent_prompt("Hello", backend_cfg)
+        self.assertEqual(status, "FAILED")
+        self.assertIn("excedió el tiempo límite", err)
+
+    # 23. Full End-to-End Pipeline simulation
     def test_end_to_end_pipeline(self):
         issue = {
             "number": 105,

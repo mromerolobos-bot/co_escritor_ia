@@ -526,11 +526,18 @@ def run_agent_prompt(prompt_text: str, backend_cfg: dict) -> Tuple[str, Optional
     max_resp = backend_cfg.get("max_response_chars", 20000)
     timeout = backend_cfg.get("timeout_seconds", 60)
 
+    # Simulación o verificación de timeout
+    if backend_cfg.get("simulate_timeout", False):
+        return "FAILED", None, f"Agent backend excedió el tiempo límite ({timeout}s)."
+
+    # Aplicar límite de tamaño al prompt
     clean_prompt = prompt_text[:max_prompt] if prompt_text else ""
 
     if b_type == "mock":
-        response = f"[Mock Agent Response] Prompt procesado exitosamente ({len(clean_prompt)} chars)."
-        return "DONE", redact_secrets(response[:max_resp]), None
+        raw_response = backend_cfg.get("mock_response") or f"[Mock Agent Response] Prompt procesado exitosamente ({len(clean_prompt)} chars)."
+        # Aplicar límite de tamaño a la respuesta
+        capped_response = raw_response[:max_resp]
+        return "DONE", redact_secrets(capped_response), None
 
     return "BLOCKED", None, f"Tipo de backend cognitivo '{b_type}' no soportado actualmente."
 
