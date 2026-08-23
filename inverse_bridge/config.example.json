@@ -1,0 +1,10 @@
+{
+  "repo": "mromerolobos-bot/co_escritor_ia",
+  "poll_seconds": 10,
+  "agent_role": "ANTIGRAVITY",
+  "allowed_roots": [
+    "C:\\pinokio\\api\\cinematic-character-studio-v1-1",
+    "C:\\Users\\Chelowolf"
+  ],
+  "dry_run": false
+}

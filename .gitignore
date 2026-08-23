@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+
+# Inverse Bridge runtime state & logs
+inverse_bridge/logs/
+inverse_bridge/.bridge.lock
+inverse_bridge/state.json
+inverse_bridge/config.json
+
+# IDE
+.vscode/
+.idea/
