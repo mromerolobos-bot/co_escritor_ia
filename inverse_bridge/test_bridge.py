@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Comprehensive Test Suite for Inverse Bridge Daemon V1.2
-Covers all PR review requirements and V1.2 security enhancements:
+Comprehensive Test Suite for Inverse Bridge Daemon V1.3
+Covers all PR review requirements, security controls, and MODE: AGENT_PROMPT:
 1. Parser valid task
 2. Reject unknown role / status / version
 3. Reject unknown MODE
@@ -16,7 +16,11 @@ Covers all PR review requirements and V1.2 security enhancements:
 12. Effective CLI --dry-run
 13. Untrusted author rejection test (trusted_issue_authors)
 14. Trusted author acceptance test
-15. Full End-to-End Pipeline simulation
+15. AGENT_PROMPT mode with disabled backend (fail-closed BLOCKED)
+16. AGENT_PROMPT mode with mock backend (DONE + agent_response)
+17. AGENT_PROMPT mode with empty prompt (FAILED)
+18. AGENT_PROMPT secret redaction in response
+19. Full End-to-End Pipeline simulation
 """
 
 import os
@@ -34,6 +38,7 @@ from inverse_bridge_daemon import (
     is_command_safe,
     is_read_only_allowed,
     run_command_safe,
+    run_agent_prompt,
     redact_secrets,
     build_claim_report,
     build_final_report,
@@ -44,7 +49,7 @@ from inverse_bridge_daemon import (
 )
 
 
-class TestInverseBridgeV12(unittest.TestCase):
+class TestInverseBridgeV13(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -58,6 +63,13 @@ class TestInverseBridgeV12(unittest.TestCase):
                 r"C:\Users\Chelowolf",
                 self.temp_dir
             ],
+            "agent_backend": {
+                "enabled": False,
+                "type": "none",
+                "timeout_seconds": 60,
+                "max_prompt_chars": 10000,
+                "max_response_chars": 20000
+            },
             "dry_run": False
         }
 
@@ -279,20 +291,94 @@ COMMANDS:
         self.assertTrue(processed, "Issue from trusted author must be accepted and processed")
         self.assertIn("TRUSTED-001", state["processed_tasks"])
 
-    # 15. Full End-to-End Pipeline simulation
+    # 15. AGENT_PROMPT mode with disabled backend (fail-closed BLOCKED)
+    def test_agent_prompt_disabled_backend(self):
+        task = {
+            "BRIDGE_PROTOCOL_VERSION": "1",
+            "TASK_ID": "PROMPT-DISABLED-01",
+            "ASSIGNEE_ROLE": "ANTIGRAVITY",
+            "STATUS": "READY",
+            "MODE": "AGENT_PROMPT",
+            "PROMPT": "¿Cuál es tu análisis táctico?"
+        }
+        status, result = execute_task(task, self.config)
+        self.assertEqual(status, "BLOCKED")
+        self.assertIsNone(result["agent_response"])
+        self.assertIn("Backend cognitivo no configurado o deshabilitado", result["errors"][0])
+
+    # 16. AGENT_PROMPT mode with mock backend (DONE + agent_response)
+    def test_agent_prompt_mock_backend(self):
+        mock_config = self.config.copy()
+        mock_config["agent_backend"] = {
+            "enabled": True,
+            "type": "mock",
+            "timeout_seconds": 60,
+            "max_prompt_chars": 10000,
+            "max_response_chars": 20000
+        }
+        task = {
+            "BRIDGE_PROTOCOL_VERSION": "1",
+            "TASK_ID": "PROMPT-MOCK-01",
+            "ASSIGNEE_ROLE": "ANTIGRAVITY",
+            "STATUS": "READY",
+            "MODE": "AGENT_PROMPT",
+            "PROMPT": "¿Cuál es tu análisis táctico?"
+        }
+        status, result = execute_task(task, mock_config)
+        self.assertEqual(status, "DONE")
+        self.assertIsNotNone(result["agent_response"])
+        self.assertIn("[Mock Agent Response]", result["agent_response"])
+
+    # 17. AGENT_PROMPT mode with empty prompt (FAILED)
+    def test_agent_prompt_empty(self):
+        task = {
+            "BRIDGE_PROTOCOL_VERSION": "1",
+            "TASK_ID": "PROMPT-EMPTY-01",
+            "ASSIGNEE_ROLE": "ANTIGRAVITY",
+            "STATUS": "READY",
+            "MODE": "AGENT_PROMPT",
+            "PROMPT": ""
+        }
+        status, result = execute_task(task, self.config)
+        self.assertEqual(status, "FAILED")
+        self.assertIn("requiere una sección PROMPT no vacía", result["errors"][0])
+
+    # 18. AGENT_PROMPT report formatting and secret redaction
+    def test_agent_prompt_report_redaction(self):
+        secret_prompt_response = "Here is the key: ghp_123456789012345678901234567890ABCDEF"
+        report = build_final_report(
+            task_id="PROMPT-RED-01",
+            status="DONE",
+            started_at="2026-08-23T00:00:00Z",
+            finished_at="2026-08-23T00:00:01Z",
+            target="N/A",
+            summary="Prompt response",
+            commands=[],
+            files_read=[],
+            file_contents=[],
+            files_changed=[],
+            artifacts=[],
+            agent_response=secret_prompt_response,
+            errors=[]
+        )
+        self.assertIn("agent_response: |", report)
+        self.assertNotIn("ghp_123456789012345678901234567890ABCDEF", report)
+        self.assertIn("[REDACTED]", report)
+
+    # 19. Full End-to-End Pipeline simulation
     def test_end_to_end_pipeline(self):
         issue = {
-            "number": 104,
+            "number": 105,
             "user": {"login": "mromerolobos-bot"},
             "body": f"""
 BRIDGE_PROTOCOL_VERSION: 1
-TASK_ID: E2E-TEST-V12
+TASK_ID: E2E-TEST-V13
 ASSIGNEE_ROLE: ANTIGRAVITY
 STATUS: READY
 MODE: EXEC
 TARGET: {self.temp_dir}
 COMMANDS:
-  - python -c "print('E2E_V12_SUCCESS')"
+  - python -c "print('E2E_V13_SUCCESS')"
 """
         }
         dry_config = self.config.copy()
@@ -301,8 +387,8 @@ COMMANDS:
         
         processed = process_single_issue(issue, dry_config, state)
         self.assertTrue(processed)
-        self.assertIn("E2E-TEST-V12", state["processed_tasks"])
-        self.assertEqual(state["processed_tasks"]["E2E-TEST-V12"]["status"], "DONE")
+        self.assertIn("E2E-TEST-V13", state["processed_tasks"])
+        self.assertEqual(state["processed_tasks"]["E2E-TEST-V13"]["status"], "DONE")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Inverse Bridge Daemon (V1.2)
+Inverse Bridge Daemon (V1.3)
 Plano de control Machine-to-Machine entre ChatGPT Plus y Antigravity mediante GitHub Issues y Pull Requests.
-Seguridad reforzada:
-- Autenticación de autor de Issue (trusted_issue_authors).
-- Allowlist estricta para comandos en MODE: READ_ONLY.
-- Volcado estructurado de contenidos leídos (file_contents) en MODE: READ_FILES.
-- Eliminación de shell=True, control de cwd=TARGET, y CLI dry-run.
+Características:
+- Soporte para MODE: EXEC (argv/shlex, shell=False), READ_FILES, READ_ONLY (allowlist), IMPLEMENT_AND_TEST.
+- Soporte para MODE: AGENT_PROMPT con capa desacoplada agent_backend (fail-closed BLOCKED por defecto).
+- Autenticación estricta de emisor de Issue (trusted_issue_authors).
+- Bloqueo global a nivel de sistema operativo mediante Windows Named Mutex.
+- Volcado estructurado de contenidos leídos (file_contents) y respuestas de agente (agent_response).
+- Redacción automática de secretos y control de rutas (allowed_roots).
 """
 
 import sys
@@ -18,6 +20,7 @@ import datetime
 import shlex
 import subprocess
 import argparse
+import tempfile
 import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Tuple
@@ -26,19 +29,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DEFAULT_STATE_PATH = os.path.join(BASE_DIR, "state.json")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
-LOCK_FILE = os.path.join(BASE_DIR, ".bridge.lock")
+GLOBAL_LOCK_FILE = os.path.join(tempfile.gettempdir(), "antigravity_inverse_bridge_global.lock")
+_MUTEX_HANDLE = None
 
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # Protocol Constants
 SUPPORTED_PROTOCOL_VERSION = 1
-KNOWN_MODES = {"EXEC", "READ_FILES", "READ_ONLY", "IMPLEMENT_AND_TEST"}
+KNOWN_MODES = {"EXEC", "READ_FILES", "READ_ONLY", "IMPLEMENT_AND_TEST", "AGENT_PROMPT"}
 KNOWN_SINGLE_KEYS = {
     "BRIDGE_PROTOCOL_VERSION", "TASK_ID", "ASSIGNEE_ROLE", "STATUS",
     "MODE", "TARGET", "DESTRUCTIVE_APPROVED"
 }
 KNOWN_SECTION_KEYS = {
-    "COMMANDS", "FILES", "OBJECTIVE", "ALLOWED", "FORBIDDEN", "RETURN", "SUMMARY",
+    "COMMANDS", "FILES", "PROMPT", "OBJECTIVE", "ALLOWED", "FORBIDDEN", "RETURN", "SUMMARY",
     "ARCHITECTURE", "TASK_DISCOVERY_RULE", "TASK DISCOVERY RULE",
     "STATE_MACHINE", "STATE MACHINE",
     "CLAIM_COMMENT_FORMAT", "CLAIM COMMENT FORMAT",
@@ -114,12 +118,6 @@ def log_message(msg: str, level: str = "INFO"):
         pass
 
 
-import tempfile
-
-GLOBAL_LOCK_FILE = os.path.join(tempfile.gettempdir(), "antigravity_inverse_bridge_global.lock")
-_MUTEX_HANDLE = None
-
-
 def acquire_lock() -> bool:
     """Garantiza la ejecución de una única instancia del daemon a nivel de sistema operativo."""
     global _MUTEX_HANDLE
@@ -133,7 +131,6 @@ def acquire_lock() -> bool:
             kernel32 = ctypes.windll.kernel32
             mutex_name = "Local\\AntigravityInverseBridge_SingleInstance_Mutex"
             
-            # CreateMutexW(lpMutexAttributes, bInitialOwner, lpName)
             kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
             kernel32.CreateMutexW.restype = wintypes.HANDLE
             
@@ -206,6 +203,13 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
             r"C:\pinokio\api\cinematic-character-studio-v1-1",
             r"C:\Users\Chelowolf"
         ],
+        "agent_backend": {
+            "enabled": False,
+            "type": "none",
+            "timeout_seconds": 60,
+            "max_prompt_chars": 10000,
+            "max_response_chars": 20000
+        },
         "dry_run": False
     }
     if os.path.exists(config_path):
@@ -276,7 +280,7 @@ def github_api_request(endpoint: str, method: str = "GET", data: Optional[dict] 
     token = get_github_token()
 
     headers = {
-        "User-Agent": "Antigravity-InverseBridge/1.2",
+        "User-Agent": "Antigravity-InverseBridge/1.3",
         "Accept": "application/vnd.github.v3+json"
     }
     if token:
@@ -509,6 +513,28 @@ def run_command_safe(
         return -1, "", err, err
 
 
+def run_agent_prompt(prompt_text: str, backend_cfg: dict) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Despacha el prompt al backend cognitivo configurado (fail-closed BLOCKED por defecto).
+    Retorna (status, agent_response, error_msg).
+    """
+    if not backend_cfg or not backend_cfg.get("enabled", False) or backend_cfg.get("type", "none") == "none":
+        return "BLOCKED", None, "Backend cognitivo no configurado o deshabilitado (agent_backend.enabled = false)."
+
+    b_type = backend_cfg.get("type", "none")
+    max_prompt = backend_cfg.get("max_prompt_chars", 10000)
+    max_resp = backend_cfg.get("max_response_chars", 20000)
+    timeout = backend_cfg.get("timeout_seconds", 60)
+
+    clean_prompt = prompt_text[:max_prompt] if prompt_text else ""
+
+    if b_type == "mock":
+        response = f"[Mock Agent Response] Prompt procesado exitosamente ({len(clean_prompt)} chars)."
+        return "DONE", redact_secrets(response[:max_resp]), None
+
+    return "BLOCKED", None, f"Tipo de backend cognitivo '{b_type}' no soportado actualmente."
+
+
 # =========================================================================
 # REPORT BUILDERS
 # =========================================================================
@@ -536,9 +562,13 @@ def build_final_report(
     file_contents: List[dict],
     files_changed: List[str],
     artifacts: List[str],
-    errors: List[str]
+    agent_response: Optional[str] = None,
+    errors: List[str] = None
 ) -> str:
     """Genera el bloque YAML-compatible estructurado para el reporte final."""
+    if errors is None:
+        errors = []
+    
     summary_lines = [f"  {line}" for line in summary.strip().splitlines()] if summary.strip() else ["  No summary"]
     lines = [
         "<<<INV_CHATGPT_REPORT>>>",
@@ -551,9 +581,15 @@ def build_final_report(
         f"target: {target or 'N/A'}",
         "summary: |",
         *summary_lines,
-        "commands:"
     ]
 
+    if agent_response:
+        lines.append("agent_response: |")
+        resp_lines = agent_response.strip().splitlines()
+        for rl in resp_lines:
+            lines.append(f"  {rl}")
+
+    lines.append("commands:")
     if not commands:
         lines.append("  []")
     else:
@@ -635,7 +671,7 @@ def build_final_report(
 
 def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
     """
-    Ejecuta una tarea aprobada con soporte dinámico de EXEC, READ_FILES, READ_ONLY e IMPLEMENT_AND_TEST.
+    Ejecuta una tarea aprobada con soporte dinámico de EXEC, READ_FILES, READ_ONLY, AGENT_PROMPT e IMPLEMENT_AND_TEST.
     """
     task_id = task.get("TASK_ID")
     target = task.get("TARGET", "")
@@ -643,6 +679,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
     destructive_approved = task.get("DESTRUCTIVE_APPROVED", "").lower() == "true"
     dry_run = config.get("dry_run", False)
     allowed_roots = config.get("allowed_roots", [])
+    agent_backend_cfg = config.get("agent_backend", {})
 
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     errors = []
@@ -651,6 +688,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
     file_contents = []
     files_changed = []
     artifacts = []
+    agent_response = None
     summary = ""
 
     # 1. Validación de Target Directory & CWD
@@ -672,6 +710,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                 "file_contents": [],
                 "files_changed": [],
                 "artifacts": [],
+                "agent_response": None,
                 "errors": [err_msg]
             }
         
@@ -683,8 +722,21 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
         else:
             exec_cwd = BASE_DIR
 
-    # 2. Modo EXEC: Ejecutar lista ordenada de comandos reales
-    if mode == "EXEC":
+    # 2. Modo AGENT_PROMPT: Consulta cognitiva
+    if mode == "AGENT_PROMPT":
+        prompt_text = task.get("PROMPT", "").strip()
+        if not prompt_text:
+            errors.append("MODE: AGENT_PROMPT requiere una sección PROMPT no vacía.")
+            status = "FAILED"
+            summary = "Ejecución fallida: PROMPT vacío."
+        else:
+            status, agent_response, err = run_agent_prompt(prompt_text, agent_backend_cfg)
+            if err:
+                errors.append(err)
+            summary = f"Consulta AGENT_PROMPT procesada con estado {status}."
+
+    # 3. Modo EXEC: Ejecutar lista ordenada de comandos reales
+    elif mode == "EXEC":
         cmd_list = parse_items_list(task.get("COMMANDS", ""))
         if not cmd_list:
             errors.append("MODE: EXEC requiere una sección COMMANDS no vacía con comandos a ejecutar.")
@@ -723,7 +775,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
             status = "DONE" if all_ok else "FAILED"
             summary = f"Ejecución de {len(cmd_list)} comando(s) en cwd='{exec_cwd}'. Estado: {status}."
 
-    # 3. Modo READ_FILES: Lectura real de archivos solicitados y volcado de contenido
+    # 4. Modo READ_FILES: Lectura real de archivos solicitados y volcado de contenido
     elif mode == "READ_FILES":
         file_list = parse_items_list(task.get("FILES", ""))
         if not file_list:
@@ -768,17 +820,15 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
             if read_summaries:
                 summary += "\n" + "\n".join(read_summaries)
 
-    # 4. Modo READ_ONLY: Diagnósticos seguros con Allowlist estricta
+    # 5. Modo READ_ONLY: Diagnósticos seguros con Allowlist estricta
     elif mode == "READ_ONLY":
         cmd_list = parse_items_list(task.get("COMMANDS", ""))
         file_list = parse_items_list(task.get("FILES", ""))
-        all_ok = True
 
         for cmd_str in cmd_list:
             is_allowed, reason = is_read_only_allowed(cmd_str)
             if not is_allowed:
                 errors.append(reason)
-                all_ok = False
                 continue
 
             if dry_run:
@@ -823,10 +873,9 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
         status = "DONE" if not errors else "FAILED"
         summary = f"Inspección READ_ONLY completada para target='{target or exec_cwd}'."
 
-    # 5. Modo IMPLEMENT_AND_TEST (Bootstrap/Setup)
+    # 6. Modo IMPLEMENT_AND_TEST (Bootstrap/Setup)
     elif mode == "IMPLEMENT_AND_TEST":
         cmd_list = parse_items_list(task.get("COMMANDS", "")) or ["python --version", "git --version"]
-        all_ok = True
         for cmd_str in cmd_list:
             if dry_run:
                 commands_run.append({
@@ -849,12 +898,10 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                 "stdout": redact_secrets(stdout),
                 "stderr": redact_secrets(stderr)
             })
-            if exit_code != 0:
-                all_ok = False
-                if err:
-                    errors.append(err)
+            if exit_code != 0 and err:
+                errors.append(err)
 
-        status = "DONE" if all_ok and not errors else "FAILED"
+        status = "DONE" if not errors else "FAILED"
         summary = f"Implementación y verificación de tests completada exitosamente para {task_id}."
 
     else:
@@ -875,6 +922,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
         "file_contents": file_contents,
         "files_changed": files_changed,
         "artifacts": artifacts,
+        "agent_response": agent_response,
         "errors": errors
     }
 
@@ -929,7 +977,7 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
     # 4. Ejecutar tarea
     status, result_data = execute_task(task, config)
 
-    # 5. Enviar Reporte Final con file_contents
+    # 5. Enviar Reporte Final con file_contents y agent_response
     final_report = build_final_report(
         task_id=result_data["task_id"],
         status=result_data["status"],
@@ -942,6 +990,7 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
         file_contents=result_data.get("file_contents", []),
         files_changed=result_data["files_changed"],
         artifacts=result_data["artifacts"],
+        agent_response=result_data.get("agent_response"),
         errors=result_data["errors"]
     )
 
