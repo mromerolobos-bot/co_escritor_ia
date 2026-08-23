@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Inverse Bridge Daemon (V1.1)
+Inverse Bridge Daemon (V1.2)
 Plano de control Machine-to-Machine entre ChatGPT Plus y Antigravity mediante GitHub Issues y Pull Requests.
-Soporte completo para EXEC (argv / shell=False), READ_FILES, READ_ONLY, control de cwd, validación estricta y CLI dry-run.
+Seguridad reforzada:
+- Autenticación de autor de Issue (trusted_issue_authors).
+- Allowlist estricta para comandos en MODE: READ_ONLY.
+- Volcado estructurado de contenidos leídos (file_contents) en MODE: READ_FILES.
+- Eliminación de shell=True, control de cwd=TARGET, y CLI dry-run.
 """
 
 import sys
@@ -47,6 +51,12 @@ KNOWN_SECTION_KEYS = {
     "DELIVERABLE", "DELIVERABLES", "DESCRIPTION", "CONTEXT", "NOTES"
 }
 ALL_KNOWN_KEYS = KNOWN_SINGLE_KEYS.union(KNOWN_SECTION_KEYS)
+
+READ_ONLY_ALLOWED_PREFIXES = (
+    "git status", "git diff", "git log", "git remote", "git branch",
+    "git show", "git tag", "dir", "ls", "python --version", "git --version",
+    "node --version", "where ", "which "
+)
 
 # Regex para detección y redacción de secretos
 SECRET_PATTERNS = [
@@ -144,6 +154,9 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
         "repo": "mromerolobos-bot/co_escritor_ia",
         "poll_seconds": 10,
         "agent_role": "ANTIGRAVITY",
+        "trusted_issue_authors": [
+            "mromerolobos-bot"
+        ],
         "allowed_roots": [
             r"C:\pinokio\api\cinematic-character-studio-v1-1",
             r"C:\Users\Chelowolf"
@@ -218,7 +231,7 @@ def github_api_request(endpoint: str, method: str = "GET", data: Optional[dict] 
     token = get_github_token()
 
     headers = {
-        "User-Agent": "Antigravity-InverseBridge/1.0",
+        "User-Agent": "Antigravity-InverseBridge/1.2",
         "Accept": "application/vnd.github.v3+json"
     }
     if token:
@@ -333,7 +346,6 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
         if match_section:
             sec_name = match_section.group(1).strip()
             if sec_name not in ALL_KNOWN_KEYS:
-                # Rechazar sección desconocida
                 log_message(f"Rechazando tarea por sección desconocida: {sec_name}", "WARNING")
                 return None
             
@@ -343,7 +355,6 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
             section_content = []
             continue
 
-        # Si encontramos una clave no conocida con formato KEY:
         if match_kv and match_kv.group(1) not in ALL_KNOWN_KEYS and not in_section:
             log_message(f"Rechazando tarea por clave desconocida: {match_kv.group(1)}", "WARNING")
             return None
@@ -354,7 +365,6 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
     if in_section:
         task[in_section] = "\n".join(section_content).strip()
 
-    # Validar campos obligatorios
     try:
         proto_ver = int(task.get("BRIDGE_PROTOCOL_VERSION", 0))
     except ValueError:
@@ -401,6 +411,15 @@ def is_command_safe(command: str, destructive_approved: bool = False) -> Tuple[b
     return True, "Safe"
 
 
+def is_read_only_allowed(command: str) -> Tuple[bool, str]:
+    """Verifica si un comando pertenece a la allowlist estricta de diagnósticos de READ_ONLY."""
+    cmd_clean = command.strip().lower()
+    for prefix in READ_ONLY_ALLOWED_PREFIXES:
+        if cmd_clean.startswith(prefix.lower()):
+            return True, "Allowed diagnostic"
+    return False, f"Comando no permitido en MODE: READ_ONLY. Debe pertenecer a la allowlist de diagnósticos: '{command}'"
+
+
 def run_command_safe(
     cmd_str: str,
     cwd: str,
@@ -416,7 +435,6 @@ def run_command_safe(
         return -1, "", reason, reason
 
     try:
-        # En Windows, shlex.split con posix=False preserva rutas con backslash correctamente
         argv = shlex.split(cmd_str, posix=(sys.platform != "win32"))
     except Exception as e:
         err = f"Error al parsear comando en argv: {e}"
@@ -470,6 +488,7 @@ def build_final_report(
     summary: str,
     commands: List[dict],
     files_read: List[str],
+    file_contents: List[dict],
     files_changed: List[str],
     artifacts: List[str],
     errors: List[str]
@@ -520,6 +539,23 @@ def build_final_report(
         for fr in files_read:
             lines.append(f"  - {fr}")
 
+    lines.append("file_contents:")
+    if not file_contents:
+        lines.append("  []")
+    else:
+        for fc in file_contents:
+            lines.append(f"  - path: {fc.get('path', '')}")
+            lines.append(f"    truncated: {'true' if fc.get('truncated') else 'false'}")
+            lines.append("    content: |")
+            raw_c = fc.get("content", "").strip().splitlines()
+            if not raw_c:
+                lines.append("      (empty)")
+            else:
+                for cl in raw_c[:200]:
+                    lines.append(f"      {cl}")
+                if len(raw_c) > 200:
+                    lines.append(f"      ... [truncated {len(raw_c)-200} lines]")
+
     lines.append("files_changed:")
     if not files_changed:
         lines.append("  []")
@@ -567,6 +603,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
     errors = []
     commands_run = []
     files_read = []
+    file_contents = []
     files_changed = []
     artifacts = []
     summary = ""
@@ -587,6 +624,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                 "summary": "Tarea bloqueada por violar la política de allowed_roots.",
                 "commands": [],
                 "files_read": [],
+                "file_contents": [],
                 "files_changed": [],
                 "artifacts": [],
                 "errors": [err_msg]
@@ -598,7 +636,6 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
         elif os.path.isfile(norm_target):
             exec_cwd = os.path.dirname(norm_target)
         else:
-            # Si target no existe en disco, verificar si está en allowed_roots
             exec_cwd = BASE_DIR
 
     # 2. Modo EXEC: Ejecutar lista ordenada de comandos reales
@@ -641,7 +678,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
             status = "DONE" if all_ok else "FAILED"
             summary = f"Ejecución de {len(cmd_list)} comando(s) en cwd='{exec_cwd}'. Estado: {status}."
 
-    # 3. Modo READ_FILES: Lectura real de archivos solicitados
+    # 3. Modo READ_FILES: Lectura real de archivos solicitados y volcado de contenido
     elif mode == "READ_FILES":
         file_list = parse_items_list(task.get("FILES", ""))
         if not file_list:
@@ -669,9 +706,15 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
 
                 try:
                     with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read(50000)  # Límite seguro de lectura
+                        raw_content = f.read(50000)
+                    
                     files_read.append(full_path)
-                    read_summaries.append(f"- Leído {full_path} ({len(content)} caracteres)")
+                    file_contents.append({
+                        "path": full_path,
+                        "truncated": len(raw_content) >= 50000,
+                        "content": redact_secrets(raw_content)
+                    })
+                    read_summaries.append(f"- Leído {full_path} ({len(raw_content)} caracteres)")
                 except Exception as e:
                     errors.append(f"Error al leer {full_path}: {e}")
 
@@ -680,13 +723,19 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
             if read_summaries:
                 summary += "\n" + "\n".join(read_summaries)
 
-    # 4. Modo READ_ONLY: Diagnósticos seguros
+    # 4. Modo READ_ONLY: Diagnósticos seguros con Allowlist estricta
     elif mode == "READ_ONLY":
         cmd_list = parse_items_list(task.get("COMMANDS", ""))
         file_list = parse_items_list(task.get("FILES", ""))
-        
-        # Ejecutar comandos de lectura si se especificaron
+        all_ok = True
+
         for cmd_str in cmd_list:
+            is_allowed, reason = is_read_only_allowed(cmd_str)
+            if not is_allowed:
+                errors.append(reason)
+                all_ok = False
+                continue
+
             if dry_run:
                 commands_run.append({
                     "command": cmd_str,
@@ -708,26 +757,34 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                 "stdout": redact_secrets(stdout),
                 "stderr": redact_secrets(stderr)
             })
-            if exit_code != 0 and err:
-                errors.append(err)
+            if exit_code != 0:
+                all_ok = False
+                if err:
+                    errors.append(err)
 
-        # Leer archivos si se especificaron
         for raw_path in file_list:
             full_path = raw_path if os.path.isabs(raw_path) else os.path.abspath(os.path.join(exec_cwd, raw_path))
             if is_target_allowed(full_path, allowed_roots) and os.path.isfile(full_path):
                 try:
                     with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                        _ = f.read(50000)
+                        raw_content = f.read(50000)
                     files_read.append(full_path)
+                    file_contents.append({
+                        "path": full_path,
+                        "truncated": len(raw_content) >= 50000,
+                        "content": redact_secrets(raw_content)
+                    })
                 except Exception as e:
                     errors.append(f"Error al leer {full_path}: {e}")
+                    all_ok = False
 
-        status = "DONE" if not errors else "FAILED"
+        status = "DONE" if all_ok and not errors else "FAILED"
         summary = f"Inspección READ_ONLY completada para target='{target or exec_cwd}'."
 
     # 5. Modo IMPLEMENT_AND_TEST (Bootstrap/Setup)
     elif mode == "IMPLEMENT_AND_TEST":
         cmd_list = parse_items_list(task.get("COMMANDS", "")) or ["python --version", "git --version"]
+        all_ok = True
         for cmd_str in cmd_list:
             if dry_run:
                 commands_run.append({
@@ -750,10 +807,12 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
                 "stdout": redact_secrets(stdout),
                 "stderr": redact_secrets(stderr)
             })
-            if exit_code != 0 and err:
-                errors.append(err)
+            if exit_code != 0:
+                all_ok = False
+                if err:
+                    errors.append(err)
 
-        status = "DONE" if not errors else "FAILED"
+        status = "DONE" if all_ok and not errors else "FAILED"
         summary = f"Implementación y verificación de tests completada exitosamente para {task_id}."
 
     else:
@@ -771,6 +830,7 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
         "summary": summary,
         "commands": commands_run,
         "files_read": files_read,
+        "file_contents": file_contents,
         "files_changed": files_changed,
         "artifacts": artifacts,
         "errors": errors
@@ -782,10 +842,20 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
 # =========================================================================
 
 def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
-    """Procesa un issue individual si cumple todas las reglas de protocolo."""
+    """
+    Procesa un issue individual validando primero el autor y las reglas del protocolo.
+    """
     issue_num = issue.get("number")
-    issue_body = issue.get("body") or ""
     
+    # 1. Autenticación estricta del emisor (trusted_issue_authors)
+    author = (issue.get("user") or {}).get("login", "").strip().lower()
+    trusted_authors = [a.lower() for a in config.get("trusted_issue_authors", ["mromerolobos-bot"])]
+    
+    if not author or author not in trusted_authors:
+        log_message(f"[SECURITY] Ignorando Issue #{issue_num} creado por autor no confiable: '{author}'. Trusted: {trusted_authors}", "WARNING")
+        return False
+
+    issue_body = issue.get("body") or ""
     task = parse_protocol_task(issue_body)
     if not task:
         return False
@@ -800,24 +870,24 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
     repo = config.get("repo", "mromerolobos-bot/co_escritor_ia")
     dry_run = config.get("dry_run", False)
 
-    log_message(f"=== Tarea detectada: {task_id} en Issue #{issue_num} (dry_run={dry_run}) ===")
+    log_message(f"=== Tarea detectada: {task_id} de autor verificado '{author}' en Issue #{issue_num} (dry_run={dry_run}) ===")
 
-    # 1. Enviar ACK Claim
+    # 2. Enviar ACK Claim
     claim_comment = build_claim_report(task_id, status="ACK", message="claimed")
     if not dry_run:
         post_issue_comment(repo, issue_num, claim_comment)
     log_message(f"ACK publicado para {task_id}")
 
-    # 2. Enviar RUNNING
+    # 3. Enviar RUNNING
     running_comment = build_claim_report(task_id, status="RUNNING", message="executing")
     if not dry_run:
         post_issue_comment(repo, issue_num, running_comment)
     log_message(f"RUNNING publicado para {task_id}")
 
-    # 3. Ejecutar tarea
+    # 4. Ejecutar tarea
     status, result_data = execute_task(task, config)
 
-    # 4. Enviar Reporte Final
+    # 5. Enviar Reporte Final con file_contents
     final_report = build_final_report(
         task_id=result_data["task_id"],
         status=result_data["status"],
@@ -827,6 +897,7 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
         summary=result_data["summary"],
         commands=result_data["commands"],
         files_read=result_data["files_read"],
+        file_contents=result_data.get("file_contents", []),
         files_changed=result_data["files_changed"],
         artifacts=result_data["artifacts"],
         errors=result_data["errors"]
@@ -837,7 +908,7 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
 
     log_message(f"Reporte final ({status}) publicado para {task_id}")
 
-    # 5. Persistir estado
+    # 6. Persistir estado
     state.setdefault("processed_tasks", {})[task_id] = {
         "status": status,
         "issue_number": issue_num,

@@ -2,6 +2,9 @@
   "repo": "mromerolobos-bot/co_escritor_ia",
   "poll_seconds": 10,
   "agent_role": "ANTIGRAVITY",
+  "trusted_issue_authors": [
+    "mromerolobos-bot"
+  ],
   "allowed_roots": [
     "C:\\pinokio\\api\\cinematic-character-studio-v1-1",
     "C:\\Users\\Chelowolf"
