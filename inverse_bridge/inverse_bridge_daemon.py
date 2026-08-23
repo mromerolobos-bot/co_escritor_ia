@@ -34,7 +34,17 @@ KNOWN_SINGLE_KEYS = {
     "MODE", "TARGET", "DESTRUCTIVE_APPROVED"
 }
 KNOWN_SECTION_KEYS = {
-    "COMMANDS", "FILES", "OBJECTIVE", "ALLOWED", "FORBIDDEN", "RETURN", "SUMMARY"
+    "COMMANDS", "FILES", "OBJECTIVE", "ALLOWED", "FORBIDDEN", "RETURN", "SUMMARY",
+    "ARCHITECTURE", "TASK_DISCOVERY_RULE", "TASK DISCOVERY RULE",
+    "STATE_MACHINE", "STATE MACHINE",
+    "CLAIM_COMMENT_FORMAT", "CLAIM COMMENT FORMAT",
+    "FINAL_REPORT_FORMAT", "FINAL REPORT FORMAT",
+    "LOCAL_FILE_LAYOUT", "LOCAL FILE LAYOUT",
+    "REQUIRED_CONFIG_FIELDS", "REQUIRED CONFIG FIELDS",
+    "SECURITY_RULES", "SECURITY RULES",
+    "IMPLEMENTATION_REQUIREMENTS", "IMPLEMENTATION REQUIREMENTS",
+    "TESTS_REQUIRED", "TESTS REQUIRED",
+    "DELIVERABLE", "DELIVERABLES", "DESCRIPTION", "CONTEXT", "NOTES"
 }
 ALL_KNOWN_KEYS = KNOWN_SINGLE_KEYS.union(KNOWN_SECTION_KEYS)
 
@@ -319,9 +329,9 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
             continue
         
         # Encabezado de sección
-        match_section = re.match(r'^([A-Z0-9_]+)\s*:\s*$', stripped)
+        match_section = re.match(r'^([A-Z0-9_ ]+)\s*:\s*$', stripped)
         if match_section:
-            sec_name = match_section.group(1)
+            sec_name = match_section.group(1).strip()
             if sec_name not in ALL_KNOWN_KEYS:
                 # Rechazar sección desconocida
                 log_message(f"Rechazando tarea por sección desconocida: {sec_name}", "WARNING")
