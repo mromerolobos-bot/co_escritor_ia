@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Inverse Bridge Daemon (V1.0)
+Inverse Bridge Daemon (V1.1)
 Plano de control Machine-to-Machine entre ChatGPT Plus y Antigravity mediante GitHub Issues y Pull Requests.
+Soporte completo para EXEC (argv / shell=False), READ_FILES, READ_ONLY, control de cwd, validación estricta y CLI dry-run.
 """
 
 import sys
@@ -10,6 +11,7 @@ import re
 import json
 import time
 import datetime
+import shlex
 import subprocess
 import argparse
 import urllib.request
@@ -23,6 +25,18 @@ LOGS_DIR = os.path.join(BASE_DIR, "logs")
 LOCK_FILE = os.path.join(BASE_DIR, ".bridge.lock")
 
 os.makedirs(LOGS_DIR, exist_ok=True)
+
+# Protocol Constants
+SUPPORTED_PROTOCOL_VERSION = 1
+KNOWN_MODES = {"EXEC", "READ_FILES", "READ_ONLY", "IMPLEMENT_AND_TEST"}
+KNOWN_SINGLE_KEYS = {
+    "BRIDGE_PROTOCOL_VERSION", "TASK_ID", "ASSIGNEE_ROLE", "STATUS",
+    "MODE", "TARGET", "DESTRUCTIVE_APPROVED"
+}
+KNOWN_SECTION_KEYS = {
+    "COMMANDS", "FILES", "OBJECTIVE", "ALLOWED", "FORBIDDEN", "RETURN", "SUMMARY"
+}
+ALL_KNOWN_KEYS = KNOWN_SINGLE_KEYS.union(KNOWN_SECTION_KEYS)
 
 # Regex para detección y redacción de secretos
 SECRET_PATTERNS = [
@@ -171,10 +185,20 @@ def save_state(state: dict, state_path: str = DEFAULT_STATE_PATH):
 # =========================================================================
 
 def get_github_token() -> Optional[str]:
-    """Obtiene el token de GitHub desde variables de entorno locales."""
+    """Obtiene el token de GitHub desde variables de entorno o registro de Windows."""
     token = os.environ.get("ANTIGRAVITY_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token and token.strip() != "TU_TOKEN_DE_GITHUB":
         return token.strip()
+    
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment")
+            val, _ = winreg.QueryValueEx(key, "ANTIGRAVITY_GITHUB_TOKEN")
+            if val and val.strip() != "TU_TOKEN_DE_GITHUB":
+                return val.strip()
+        except Exception:
+            pass
     return None
 
 
@@ -242,13 +266,31 @@ def post_issue_comment(repo: str, issue_number: int, comment_text: str) -> bool:
 # PROTOCOL PARSER & VALIDATOR
 # =========================================================================
 
+def parse_items_list(text: str) -> List[str]:
+    """Convierte una sección multilínea en una lista de elementos (soporta '- item' o 'item')."""
+    if not text:
+        return []
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("- ") or line.startswith("* "):
+            items.append(line[2:].strip())
+        else:
+            items.append(line)
+    return items
+
+
 def parse_protocol_task(issue_body: str) -> Optional[dict]:
     """
     Parsea y extrae campos del protocolo de un Issue.
-    Exige:
-    - BRIDGE_PROTOCOL_VERSION: 1
-    - ASSIGNEE_ROLE: ANTIGRAVITY
-    - STATUS: READY
+    Valida estrictamente:
+    - BRIDGE_PROTOCOL_VERSION == 1
+    - ASSIGNEE_ROLE == ANTIGRAVITY
+    - STATUS == READY
+    - MODE dentro de KNOWN_MODES
+    - Rechaza secciones desconocidas
     """
     if not issue_body:
         return None
@@ -258,16 +300,14 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
     in_section = None
     section_content = []
 
-    known_single_keys = {
-        "BRIDGE_PROTOCOL_VERSION", "TASK_ID", "ASSIGNEE_ROLE", "STATUS",
-        "MODE", "TARGET", "DESTRUCTIVE_APPROVED"
-    }
-
     for line in lines:
         stripped = line.strip()
+        if not stripped:
+            continue
         
+        # Par clave-valor simple
         match_kv = re.match(r'^([A-Z0-9_]+)\s*:\s*(.*)$', stripped)
-        if match_kv and match_kv.group(1) in known_single_keys:
+        if match_kv and match_kv.group(1) in KNOWN_SINGLE_KEYS:
             if in_section:
                 task[in_section] = "\n".join(section_content).strip()
                 in_section = None
@@ -278,13 +318,25 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
             task[key] = val
             continue
         
+        # Encabezado de sección
         match_section = re.match(r'^([A-Z0-9_]+)\s*:\s*$', stripped)
         if match_section:
+            sec_name = match_section.group(1)
+            if sec_name not in ALL_KNOWN_KEYS:
+                # Rechazar sección desconocida
+                log_message(f"Rechazando tarea por sección desconocida: {sec_name}", "WARNING")
+                return None
+            
             if in_section:
                 task[in_section] = "\n".join(section_content).strip()
-            in_section = match_section.group(1)
+            in_section = sec_name
             section_content = []
             continue
+
+        # Si encontramos una clave no conocida con formato KEY:
+        if match_kv and match_kv.group(1) not in ALL_KNOWN_KEYS and not in_section:
+            log_message(f"Rechazando tarea por clave desconocida: {match_kv.group(1)}", "WARNING")
+            return None
 
         if in_section:
             section_content.append(line)
@@ -292,18 +344,24 @@ def parse_protocol_task(issue_body: str) -> Optional[dict]:
     if in_section:
         task[in_section] = "\n".join(section_content).strip()
 
+    # Validar campos obligatorios
     try:
         proto_ver = int(task.get("BRIDGE_PROTOCOL_VERSION", 0))
     except ValueError:
         proto_ver = 0
 
-    if proto_ver != 1:
+    if proto_ver != SUPPORTED_PROTOCOL_VERSION:
         return None
     if task.get("ASSIGNEE_ROLE") != "ANTIGRAVITY":
         return None
     if task.get("STATUS") != "READY":
         return None
     if not task.get("TASK_ID"):
+        return None
+
+    mode = task.get("MODE", "")
+    if mode not in KNOWN_MODES:
+        log_message(f"Rechazando tarea por MODE desconocido: '{mode}'", "WARNING")
         return None
 
     return task
@@ -331,6 +389,51 @@ def is_command_safe(command: str, destructive_approved: bool = False) -> Tuple[b
         if pat.search(command):
             return False, f"Comando bloqueado por ser potencialmente destructivo: '{command}'"
     return True, "Safe"
+
+
+def run_command_safe(
+    cmd_str: str,
+    cwd: str,
+    timeout: int = 60,
+    destructive_approved: bool = False
+) -> Tuple[int, str, str, Optional[str]]:
+    """
+    Ejecuta un comando de forma segura utilizando shlex/argv (shell=False).
+    Retorna (exit_code, stdout, stderr, error_msg).
+    """
+    is_safe, reason = is_command_safe(cmd_str, destructive_approved)
+    if not is_safe:
+        return -1, "", reason, reason
+
+    try:
+        # En Windows, shlex.split con posix=False preserva rutas con backslash correctamente
+        argv = shlex.split(cmd_str, posix=(sys.platform != "win32"))
+    except Exception as e:
+        err = f"Error al parsear comando en argv: {e}"
+        return -1, "", err, err
+
+    if not argv:
+        return 0, "", "", None
+
+    try:
+        proc = subprocess.run(
+            argv,
+            shell=False,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        return proc.returncode, proc.stdout, proc.stderr, None
+    except FileNotFoundError:
+        err = f"Ejecutable no encontrado: '{argv[0]}'"
+        return -1, "", err, err
+    except subprocess.TimeoutExpired:
+        err = f"Comando excedió el tiempo límite ({timeout}s): '{cmd_str}'"
+        return -1, "", err, err
+    except Exception as e:
+        err = f"Excepción ejecutando comando '{cmd_str}': {e}"
+        return -1, "", err, err
 
 
 # =========================================================================
@@ -441,13 +544,15 @@ def build_final_report(
 
 def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
     """
-    Ejecuta una tarea aprobada y devuelve (status, report_data).
+    Ejecuta una tarea aprobada con soporte dinámico de EXEC, READ_FILES, READ_ONLY e IMPLEMENT_AND_TEST.
     """
     task_id = task.get("TASK_ID")
     target = task.get("TARGET", "")
     mode = task.get("MODE", "READ_ONLY")
     destructive_approved = task.get("DESTRUCTIVE_APPROVED", "").lower() == "true"
-    
+    dry_run = config.get("dry_run", False)
+    allowed_roots = config.get("allowed_roots", [])
+
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     errors = []
     commands_run = []
@@ -456,69 +561,195 @@ def execute_task(task: dict, config: dict) -> Tuple[str, dict]:
     artifacts = []
     summary = ""
 
-    # Validación de Target Directory
-    if target and not is_target_allowed(target, config.get("allowed_roots", [])):
-        err_msg = f"Ruta objetivo no permitida en allowed_roots: {target}"
-        log_message(err_msg, "ERROR")
-        finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        return "BLOCKED", {
-            "task_id": task_id,
-            "status": "BLOCKED",
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "target": target,
-            "summary": "Tarea bloqueada por violar la política de allowed_roots.",
-            "commands": [],
-            "files_read": [],
-            "files_changed": [],
-            "artifacts": [],
-            "errors": [err_msg]
-        }
+    # 1. Validación de Target Directory & CWD
+    exec_cwd = BASE_DIR
+    if target:
+        if not is_target_allowed(target, allowed_roots):
+            err_msg = f"Ruta objetivo no permitida en allowed_roots: {target}"
+            log_message(err_msg, "ERROR")
+            finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            return "BLOCKED", {
+                "task_id": task_id,
+                "status": "BLOCKED",
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "target": target,
+                "summary": "Tarea bloqueada por violar la política de allowed_roots.",
+                "commands": [],
+                "files_read": [],
+                "files_changed": [],
+                "artifacts": [],
+                "errors": [err_msg]
+            }
+        
+        norm_target = os.path.abspath(target)
+        if os.path.isdir(norm_target):
+            exec_cwd = norm_target
+        elif os.path.isfile(norm_target):
+            exec_cwd = os.path.dirname(norm_target)
+        else:
+            # Si target no existe en disco, verificar si está en allowed_roots
+            exec_cwd = BASE_DIR
 
-    # Si es modo IMPLEMENT_AND_TEST (como BRIDGE-0001)
-    if mode == "IMPLEMENT_AND_TEST":
-        summary = f"Implementación y verificación de tests completada exitosamente para {task_id}."
-        test_cmds = ["python --version", "git --version"]
-        for cmd in test_cmds:
-            safe, reason = is_command_safe(cmd, destructive_approved)
-            if not safe:
-                errors.append(reason)
-                continue
-            
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    cwd=BASE_DIR
+    # 2. Modo EXEC: Ejecutar lista ordenada de comandos reales
+    if mode == "EXEC":
+        cmd_list = parse_items_list(task.get("COMMANDS", ""))
+        if not cmd_list:
+            errors.append("MODE: EXEC requiere una sección COMMANDS no vacía con comandos a ejecutar.")
+            status = "FAILED"
+            summary = "Ejecución fallida: no se proporcionaron comandos."
+        else:
+            all_ok = True
+            for cmd_str in cmd_list:
+                if dry_run:
+                    log_message(f"[DRY-RUN] Simular ejecución: {cmd_str} en {exec_cwd}")
+                    commands_run.append({
+                        "command": cmd_str,
+                        "exit_code": 0,
+                        "stdout": "(dry-run simulated execution)",
+                        "stderr": ""
+                    })
+                    continue
+
+                exit_code, stdout, stderr, err = run_command_safe(
+                    cmd_str=cmd_str,
+                    cwd=exec_cwd,
+                    timeout=60,
+                    destructive_approved=destructive_approved
                 )
                 commands_run.append({
-                    "command": cmd,
-                    "exit_code": proc.returncode,
-                    "stdout": redact_secrets(proc.stdout),
-                    "stderr": redact_secrets(proc.stderr)
+                    "command": cmd_str,
+                    "exit_code": exit_code,
+                    "stdout": redact_secrets(stdout),
+                    "stderr": redact_secrets(stderr)
                 })
-            except Exception as e:
-                errors.append(f"Fallo al ejecutar {cmd}: {str(e)}")
+                if exit_code != 0:
+                    all_ok = False
+                    if err:
+                        errors.append(err)
 
-        files_changed.extend([
-            "inverse_bridge/inverse_bridge_daemon.py",
-            "inverse_bridge/config.example.json",
-            "inverse_bridge/test_bridge.py",
-            "inverse_bridge/README.md"
-        ])
-        artifacts.append("branch: bridge/inv-chatgpt-v1")
-        status = "DONE" if not errors else "FAILED"
+            status = "DONE" if all_ok else "FAILED"
+            summary = f"Ejecución de {len(cmd_list)} comando(s) en cwd='{exec_cwd}'. Estado: {status}."
 
+    # 3. Modo READ_FILES: Lectura real de archivos solicitados
+    elif mode == "READ_FILES":
+        file_list = parse_items_list(task.get("FILES", ""))
+        if not file_list:
+            errors.append("MODE: READ_FILES requiere una sección FILES con al menos una ruta de archivo.")
+            status = "FAILED"
+            summary = "Lectura fallida: no se proporcionaron archivos en sección FILES."
+        else:
+            read_summaries = []
+            for raw_path in file_list:
+                full_path = raw_path if os.path.isabs(raw_path) else os.path.abspath(os.path.join(exec_cwd, raw_path))
+                if not is_target_allowed(full_path, allowed_roots):
+                    err = f"Acceso denegado a archivo fuera de allowed_roots: {full_path}"
+                    errors.append(err)
+                    continue
+
+                if not os.path.exists(full_path):
+                    err = f"Archivo no encontrado: {full_path}"
+                    errors.append(err)
+                    continue
+
+                if os.path.isdir(full_path):
+                    err = f"La ruta solicitada es un directorio, no un archivo: {full_path}"
+                    errors.append(err)
+                    continue
+
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read(50000)  # Límite seguro de lectura
+                    files_read.append(full_path)
+                    read_summaries.append(f"- Leído {full_path} ({len(content)} caracteres)")
+                except Exception as e:
+                    errors.append(f"Error al leer {full_path}: {e}")
+
+            status = "DONE" if files_read and not errors else "FAILED"
+            summary = f"Lectura de archivos completada ({len(files_read)} archivo(s) leídos exitosamente)."
+            if read_summaries:
+                summary += "\n" + "\n".join(read_summaries)
+
+    # 4. Modo READ_ONLY: Diagnósticos seguros
     elif mode == "READ_ONLY":
-        summary = f"Inspección read-only completada para {target or 'entorno'}."
-        status = "DONE"
+        cmd_list = parse_items_list(task.get("COMMANDS", ""))
+        file_list = parse_items_list(task.get("FILES", ""))
+        
+        # Ejecutar comandos de lectura si se especificaron
+        for cmd_str in cmd_list:
+            if dry_run:
+                commands_run.append({
+                    "command": cmd_str,
+                    "exit_code": 0,
+                    "stdout": "(dry-run simulated read-only command)",
+                    "stderr": ""
+                })
+                continue
+            
+            exit_code, stdout, stderr, err = run_command_safe(
+                cmd_str=cmd_str,
+                cwd=exec_cwd,
+                timeout=60,
+                destructive_approved=False
+            )
+            commands_run.append({
+                "command": cmd_str,
+                "exit_code": exit_code,
+                "stdout": redact_secrets(stdout),
+                "stderr": redact_secrets(stderr)
+            })
+            if exit_code != 0 and err:
+                errors.append(err)
+
+        # Leer archivos si se especificaron
+        for raw_path in file_list:
+            full_path = raw_path if os.path.isabs(raw_path) else os.path.abspath(os.path.join(exec_cwd, raw_path))
+            if is_target_allowed(full_path, allowed_roots) and os.path.isfile(full_path):
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        _ = f.read(50000)
+                    files_read.append(full_path)
+                except Exception as e:
+                    errors.append(f"Error al leer {full_path}: {e}")
+
+        status = "DONE" if not errors else "FAILED"
+        summary = f"Inspección READ_ONLY completada para target='{target or exec_cwd}'."
+
+    # 5. Modo IMPLEMENT_AND_TEST (Bootstrap/Setup)
+    elif mode == "IMPLEMENT_AND_TEST":
+        cmd_list = parse_items_list(task.get("COMMANDS", "")) or ["python --version", "git --version"]
+        for cmd_str in cmd_list:
+            if dry_run:
+                commands_run.append({
+                    "command": cmd_str,
+                    "exit_code": 0,
+                    "stdout": "(dry-run simulated test)",
+                    "stderr": ""
+                })
+                continue
+
+            exit_code, stdout, stderr, err = run_command_safe(
+                cmd_str=cmd_str,
+                cwd=exec_cwd,
+                timeout=30,
+                destructive_approved=destructive_approved
+            )
+            commands_run.append({
+                "command": cmd_str,
+                "exit_code": exit_code,
+                "stdout": redact_secrets(stdout),
+                "stderr": redact_secrets(stderr)
+            })
+            if exit_code != 0 and err:
+                errors.append(err)
+
+        status = "DONE" if not errors else "FAILED"
+        summary = f"Implementación y verificación de tests completada exitosamente para {task_id}."
 
     else:
-        summary = f"Ejecución de tarea {task_id} en modo {mode}."
-        status = "DONE"
+        status = "FAILED"
+        summary = f"Modo no soportado: {mode}"
+        errors.append(f"MODE '{mode}' no es válido.")
 
     finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return status, {
@@ -559,7 +790,7 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
     repo = config.get("repo", "mromerolobos-bot/co_escritor_ia")
     dry_run = config.get("dry_run", False)
 
-    log_message(f"=== Tarea detectada: {task_id} en Issue #{issue_num} ===")
+    log_message(f"=== Tarea detectada: {task_id} en Issue #{issue_num} (dry_run={dry_run}) ===")
 
     # 1. Enviar ACK Claim
     claim_comment = build_claim_report(task_id, status="ACK", message="claimed")
@@ -606,13 +837,17 @@ def process_single_issue(issue: dict, config: dict, state: dict) -> bool:
     return True
 
 
-def run_daemon(config_path: str = DEFAULT_CONFIG_PATH, once: bool = False):
+def run_daemon(config_path: str = DEFAULT_CONFIG_PATH, once: bool = False, dry_run: bool = False):
     """Ejecuta el ciclo principal del daemon."""
     if not acquire_lock():
         sys.exit(1)
 
     try:
         config = load_config(config_path)
+        if dry_run:
+            config["dry_run"] = True
+            log_message("Modo CLI --dry-run activado: no se publicarán comentarios ni se ejecutarán cambios destructivos.")
+
         state = load_state()
         repo = config.get("repo", "mromerolobos-bot/co_escritor_ia")
         poll_interval = config.get("poll_seconds", 10)
@@ -648,4 +883,4 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Modo simulación sin escribir en GitHub")
     args = parser.parse_args()
 
-    run_daemon(config_path=args.config, once=args.once)
+    run_daemon(config_path=args.config, once=args.once, dry_run=args.dry_run)

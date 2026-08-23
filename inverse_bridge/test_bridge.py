@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Test Suite for Inverse Bridge Daemon
-Tests all safety rules, protocol parsing, deduplication, secret redaction, and execution.
+Comprehensive Test Suite for Inverse Bridge Daemon V1.1
+Covers all 10 PR review requirements:
+1. Parser valid task
+2. Reject unknown role / status / version
+3. Reject unknown MODE
+4. Reject unknown section/key
+5. Reject target outside allowed_roots
+6. Deduplication test
+7. Secret redaction test
+8. Destructive command safety blocking
+9. EXEC mode with real commands payload (shell=False, cwd=TARGET)
+10. READ_FILES mode with real files
+11. Effective CLI --dry-run
+12. End-to-End simulation of full pipeline (READY -> ACK -> RUNNING -> EXEC payload -> DONE)
 """
 
 import os
@@ -15,8 +27,10 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from inverse_bridge_daemon import (
     parse_protocol_task,
+    parse_items_list,
     is_target_allowed,
     is_command_safe,
+    run_command_safe,
     redact_secrets,
     build_claim_report,
     build_final_report,
@@ -27,18 +41,20 @@ from inverse_bridge_daemon import (
 )
 
 
-class TestInverseBridge(unittest.TestCase):
+class TestInverseBridgeV11(unittest.TestCase):
 
     def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
         self.config = {
             "repo": "mromerolobos-bot/co_escritor_ia",
             "poll_seconds": 10,
             "agent_role": "ANTIGRAVITY",
             "allowed_roots": [
                 r"C:\pinokio\api\cinematic-character-studio-v1-1",
-                r"C:\Users\Chelowolf"
+                r"C:\Users\Chelowolf",
+                self.temp_dir
             ],
-            "dry_run": True
+            "dry_run": False
         }
 
     # 1. Parser test for valid task
@@ -48,43 +64,45 @@ BRIDGE_PROTOCOL_VERSION: 1
 TASK_ID: TEST-0001
 ASSIGNEE_ROLE: ANTIGRAVITY
 STATUS: READY
-MODE: READ_ONLY
+MODE: EXEC
 TARGET: C:\\Users\\Chelowolf
+COMMANDS:
+  - python --version
+  - git --version
 """
         task = parse_protocol_task(valid_body)
         self.assertIsNotNone(task)
         self.assertEqual(task.get("TASK_ID"), "TEST-0001")
         self.assertEqual(task.get("ASSIGNEE_ROLE"), "ANTIGRAVITY")
         self.assertEqual(task.get("STATUS"), "READY")
-        self.assertEqual(task.get("MODE"), "READ_ONLY")
+        self.assertEqual(task.get("MODE"), "EXEC")
+        cmds = parse_items_list(task.get("COMMANDS", ""))
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual(cmds[0], "python --version")
+        self.assertEqual(cmds[1], "git --version")
 
-    # 2. Reject task with wrong role or wrong status
+    # 2. Reject wrong role, status or version
     def test_reject_wrong_role_or_status(self):
-        wrong_role = """
-BRIDGE_PROTOCOL_VERSION: 1
-TASK_ID: TEST-0002
-ASSIGNEE_ROLE: HUMAN_DIRECTOR
-STATUS: READY
-"""
+        wrong_role = "BRIDGE_PROTOCOL_VERSION: 1\nTASK_ID: T1\nASSIGNEE_ROLE: DIRECTOR\nSTATUS: READY\nMODE: EXEC\n"
         self.assertIsNone(parse_protocol_task(wrong_role))
 
-        not_ready = """
-BRIDGE_PROTOCOL_VERSION: 1
-TASK_ID: TEST-0003
-ASSIGNEE_ROLE: ANTIGRAVITY
-STATUS: IN_PROGRESS
-"""
+        not_ready = "BRIDGE_PROTOCOL_VERSION: 1\nTASK_ID: T2\nASSIGNEE_ROLE: ANTIGRAVITY\nSTATUS: IN_PROGRESS\nMODE: EXEC\n"
         self.assertIsNone(parse_protocol_task(not_ready))
 
-        wrong_version = """
-BRIDGE_PROTOCOL_VERSION: 2
-TASK_ID: TEST-0004
-ASSIGNEE_ROLE: ANTIGRAVITY
-STATUS: READY
-"""
+        wrong_version = "BRIDGE_PROTOCOL_VERSION: 2\nTASK_ID: T3\nASSIGNEE_ROLE: ANTIGRAVITY\nSTATUS: READY\nMODE: EXEC\n"
         self.assertIsNone(parse_protocol_task(wrong_version))
 
-    # 3. Reject target outside allowed_roots
+    # 3. Reject unknown MODE
+    def test_reject_unknown_mode(self):
+        invalid_mode = "BRIDGE_PROTOCOL_VERSION: 1\nTASK_ID: T4\nASSIGNEE_ROLE: ANTIGRAVITY\nSTATUS: READY\nMODE: ARBITRARY_SUPER_MODE\n"
+        self.assertIsNone(parse_protocol_task(invalid_mode))
+
+    # 4. Reject unknown section/key
+    def test_reject_unknown_section(self):
+        unknown_sec = "BRIDGE_PROTOCOL_VERSION: 1\nTASK_ID: T5\nASSIGNEE_ROLE: ANTIGRAVITY\nSTATUS: READY\nMODE: EXEC\nUNKNOWN_SECTION_KEY:\n- hello\n"
+        self.assertIsNone(parse_protocol_task(unknown_sec))
+
+    # 5. Reject target outside allowed_roots
     def test_reject_target_outside_allowed_roots(self):
         allowed_path = r"C:\Users\Chelowolf\Documents\test"
         forbidden_path = r"C:\Windows\System32"
@@ -92,46 +110,42 @@ STATUS: READY
         self.assertTrue(is_target_allowed(allowed_path, self.config["allowed_roots"]))
         self.assertFalse(is_target_allowed(forbidden_path, self.config["allowed_roots"]))
 
-        # Execution check
         task = {
+            "BRIDGE_PROTOCOL_VERSION": "1",
             "TASK_ID": "TEST-FORBIDDEN",
             "TARGET": forbidden_path,
-            "MODE": "READ_ONLY"
+            "MODE": "EXEC",
+            "COMMANDS": "python --version"
         }
         status, result = execute_task(task, self.config)
         self.assertEqual(status, "BLOCKED")
         self.assertIn("Ruta objetivo no permitida", result["errors"][0])
 
-    # 4. Deduplication test
+    # 6. Deduplication test
     def test_deduplication(self):
         state = {
             "processed_tasks": {
-                "ALREADY_DONE_TASK": {"status": "DONE"}
+                "TASK-ALREADY-DONE": {"status": "DONE"}
             }
         }
         issue = {
             "number": 99,
-            "body": """
-BRIDGE_PROTOCOL_VERSION: 1
-TASK_ID: ALREADY_DONE_TASK
-ASSIGNEE_ROLE: ANTIGRAVITY
-STATUS: READY
-"""
+            "body": "BRIDGE_PROTOCOL_VERSION: 1\nTASK_ID: TASK-ALREADY-DONE\nASSIGNEE_ROLE: ANTIGRAVITY\nSTATUS: READY\nMODE: EXEC\nCOMMANDS:\n- python --version\n"
         }
         processed = process_single_issue(issue, self.config, state)
         self.assertFalse(processed, "Should not re-process already processed task")
 
-    # 5. Secret-redaction test
+    # 7. Secret redaction test
     def test_secret_redaction(self):
-        sample_text = "My token is ghp_123456789012345678901234567890ABCDEF and bearer github_pat_11ABCDEFG123456789012345678901234567890_test"
-        redacted = redact_secrets(sample_text)
+        sample = "Token is ghp_123456789012345678901234567890ABCDEF and github_pat_11FAKE_SYNTHETIC_TEST_TOKEN_NOT_REAL_12345678901234567890"
+        redacted = redact_secrets(sample)
         self.assertNotIn("ghp_123456789012345678901234567890ABCDEF", redacted)
-        self.assertNotIn("github_pat_11ABCDEFG123456789012345678901234567890_test", redacted)
+        self.assertNotIn("github_pat_11FAKE_SYNTHETIC_TEST_TOKEN_NOT_REAL_12345678901234567890", redacted)
         self.assertIn("[REDACTED]", redacted)
 
-    # 6. Destructive command safety check
+    # 8. Destructive command blocking test
     def test_destructive_command_blocking(self):
-        safe_cmd = "git --version"
+        safe_cmd = "git status"
         destructive_cmd = "rmdir /s /q C:\\something"
         
         is_safe, _ = is_command_safe(safe_cmd, destructive_approved=False)
@@ -143,37 +157,86 @@ STATUS: READY
         is_safe_override, _ = is_command_safe(destructive_cmd, destructive_approved=True)
         self.assertTrue(is_safe_override)
 
-    # 7. End-to-end harmless task test (python --version & git --version)
-    def test_e2e_harmless_task(self):
+    # 9. EXEC mode with real commands payload and cwd=TARGET (shell=False)
+    def test_exec_mode_real_commands(self):
         task = {
             "BRIDGE_PROTOCOL_VERSION": "1",
-            "TASK_ID": "TEST-E2E-001",
+            "TASK_ID": "TEST-EXEC-001",
             "ASSIGNEE_ROLE": "ANTIGRAVITY",
             "STATUS": "READY",
-            "MODE": "IMPLEMENT_AND_TEST",
-            "TARGET": r"C:\Users\Chelowolf"
+            "MODE": "EXEC",
+            "TARGET": self.temp_dir,
+            "COMMANDS": "python --version\ngit --version"
         }
         status, result = execute_task(task, self.config)
         self.assertEqual(status, "DONE")
-        self.assertTrue(len(result["commands"]) >= 2)
+        self.assertEqual(len(result["commands"]), 2)
+        self.assertEqual(result["commands"][0]["exit_code"], 0)
+        self.assertIn("Python", result["commands"][0]["stdout"])
+        self.assertEqual(result["commands"][1]["exit_code"], 0)
+        self.assertIn("git", result["commands"][1]["stdout"].lower())
+
+    # 10. READ_FILES mode with real files
+    def test_read_files_mode(self):
+        test_file = os.path.join(self.temp_dir, "sample.txt")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("Hello from Inverse Bridge test file!")
+
+        task = {
+            "BRIDGE_PROTOCOL_VERSION": "1",
+            "TASK_ID": "TEST-READ-001",
+            "ASSIGNEE_ROLE": "ANTIGRAVITY",
+            "STATUS": "READY",
+            "MODE": "READ_FILES",
+            "TARGET": self.temp_dir,
+            "FILES": f"- {test_file}"
+        }
+        status, result = execute_task(task, self.config)
+        self.assertEqual(status, "DONE")
+        self.assertIn(test_file, result["files_read"])
+        self.assertIn("sample.txt", result["summary"])
+
+    # 11. Effective CLI dry-run
+    def test_dry_run_flag(self):
+        dry_config = self.config.copy()
+        dry_config["dry_run"] = True
         
-        # Verificar que se generó reporte válido
-        final_report = build_final_report(
-            task_id=result["task_id"],
-            status=result["status"],
-            started_at=result["started_at"],
-            finished_at=result["finished_at"],
-            target=result["target"],
-            summary=result["summary"],
-            commands=result["commands"],
-            files_read=result["files_read"],
-            files_changed=result["files_changed"],
-            artifacts=result["artifacts"],
-            errors=result["errors"]
-        )
-        self.assertIn("<<<INV_CHATGPT_REPORT>>>", final_report)
-        self.assertIn("status: DONE", final_report)
-        self.assertIn("<<<END_INV_CHATGPT_REPORT>>>", final_report)
+        task = {
+            "BRIDGE_PROTOCOL_VERSION": "1",
+            "TASK_ID": "TEST-DRY-001",
+            "ASSIGNEE_ROLE": "ANTIGRAVITY",
+            "STATUS": "READY",
+            "MODE": "EXEC",
+            "TARGET": self.temp_dir,
+            "COMMANDS": "- python --version"
+        }
+        status, result = execute_task(task, dry_config)
+        self.assertEqual(status, "DONE")
+        self.assertIn("dry-run simulated execution", result["commands"][0]["stdout"])
+
+    # 12. Full End-to-End Pipeline simulation
+    def test_end_to_end_pipeline(self):
+        issue = {
+            "number": 101,
+            "body": f"""
+BRIDGE_PROTOCOL_VERSION: 1
+TASK_ID: E2E-TEST-999
+ASSIGNEE_ROLE: ANTIGRAVITY
+STATUS: READY
+MODE: EXEC
+TARGET: {self.temp_dir}
+COMMANDS:
+  - python -c "print('E2E_INVERSE_BRIDGE_SUCCESS')"
+"""
+        }
+        dry_config = self.config.copy()
+        dry_config["dry_run"] = True
+        state = {"processed_tasks": {}}
+        
+        processed = process_single_issue(issue, dry_config, state)
+        self.assertTrue(processed)
+        self.assertIn("E2E-TEST-999", state["processed_tasks"])
+        self.assertEqual(state["processed_tasks"]["E2E-TEST-999"]["status"], "DONE")
 
 
 if __name__ == "__main__":
