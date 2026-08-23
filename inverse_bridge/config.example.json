@@ -1,0 +1,20 @@
+{
+  "repo": "mromerolobos-bot/co_escritor_ia",
+  "poll_seconds": 10,
+  "agent_role": "ANTIGRAVITY",
+  "trusted_issue_authors": [
+    "mromerolobos-bot"
+  ],
+  "allowed_roots": [
+    "C:\\pinokio\\api\\cinematic-character-studio-v1-1",
+    "C:\\Users\\Chelowolf"
+  ],
+  "agent_backend": {
+    "enabled": false,
+    "type": "none",
+    "timeout_seconds": 60,
+    "max_prompt_chars": 10000,
+    "max_response_chars": 20000
+  },
+  "dry_run": false
+}
