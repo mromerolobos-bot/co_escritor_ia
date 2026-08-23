@@ -1,0 +1,1 @@
+V1.4 plan: patch local inverse_bridge_daemon.py with explicit DETACH: support and automatic non-blocking launch for a small GUI allowlist; add regression tests; validate locally; then commit reviewed runtime changes separately.
